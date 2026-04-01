@@ -1,0 +1,99 @@
+name: Send kernel patch
+
+on:
+  workflow_dispatch:
+    inputs:
+      to:
+        description: "Primary recipient"
+        required: true
+        default: "chenhuacai@kernel.org"
+      cc:
+        description: "Comma-separated CC list"
+        required: true
+        default: "kernel@xen0n.name,loongarch@lists.linux.dev,linux-kernel@vger.kernel.org,linux-mm@kvack.org,akpm@linux-foundation.org"
+      in_reply_to:
+        description: "Optional In-Reply-To Message-ID"
+        required: false
+        default: ""
+      patch:
+        description: "Patch file path"
+        required: true
+        default: "0001-LoongArch-mm-fix-FLATMEM-ARCH_PFN_OFFSET-for-non-zer.patch"
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install git-email and msmtp
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            msmtp msmtp-mta ca-certificates curl perl \
+            libmailtools-perl \
+            libnet-smtp-ssl-perl \
+            libio-socket-ssl-perl \
+            libauthen-sasl-perl \
+            libemail-valid-perl
+
+      - name: Install git-send-email
+        run: |
+          sudo curl -fsSL https://raw.githubusercontent.com/git/git/v2.53.0/git-send-email.perl -o /usr/local/bin/git-send-email
+          sudo chmod +x /usr/local/bin/git-send-email
+          git --version
+          command -v git-send-email
+
+      - name: Configure msmtp
+        run: |
+          cat > ~/.msmtprc <<'EOF'
+          defaults
+          auth on
+          tls on
+          tls_starttls on
+          tls_trust_file /etc/ssl/certs/ca-certificates.crt
+          domain gmail.com
+
+          account gmail
+          host smtp.gmail.com
+          port 587
+          from ethan.yang.kernel@gmail.com
+          user ethan.yang.kernel@gmail.com
+          password ${{ secrets.GMAIL_APP_PASSWORD }}
+
+          account default : gmail
+          EOF
+          chmod 600 ~/.msmtprc
+
+      - name: Configure git send-email
+        run: |
+          git config --global user.name "Ethan Yang"
+          git config --global user.email "ethan.yang.kernel@gmail.com"
+          git config --global sendemail.smtpServer /usr/bin/msmtp
+          git config --global sendemail.from "Ethan Yang <ethan.yang.kernel@gmail.com>"
+          git config --global sendemail.suppresscc self
+          git config --global sendemail.confirm auto
+
+      - name: Test SMTP connectivity
+        run: |
+          timeout 10 bash -c "</dev/tcp/smtp.gmail.com/587" && echo OK || echo FAIL
+
+      - name: Send patch
+        shell: bash
+        run: |
+          IFS=',' read -ra CC_ARR <<< "${{ github.event.inputs.cc }}"
+          CC_ARGS=()
+          for c in "${CC_ARR[@]}"; do
+            CC_ARGS+=(--cc "$c")
+          done
+
+          EXTRA_ARGS=()
+          if [ -n "${{ github.event.inputs.in_reply_to }}" ]; then
+            EXTRA_ARGS+=(--in-reply-to "${{ github.event.inputs.in_reply_to }}")
+          fi
+
+          git send-email \
+            --to "${{ github.event.inputs.to }}" \
+            "${CC_ARGS[@]}" \
+            "${EXTRA_ARGS[@]}" \
+            "${{ github.event.inputs.patch }}"
