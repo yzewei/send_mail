@@ -1,0 +1,92 @@
+From 9f79dc081321c999493166cd8aa8e1af372efff6 Mon Sep 17 00:00:00 2001
+From: Ethan Yang <ethan.yang.kernel@gmail.com>
+Date: Fri, 3 Apr 2026 17:57:04 +0800
+Subject: [PATCH v2] KVM: x86: Don't leave APF half-enabled on bad APF data GPA
+
+kvm_pv_enable_async_pf() updates vcpu->arch.apf.msr_en_val before
+initializing the APF data gfn_to_hva cache. If userspace provides an
+invalid GPA, kvm_gfn_to_hva_cache_init() fails, but msr_en_val stays
+enabled and leaves APF state half-initialized.
+
+Later APF paths can then try to use the empty cache and trigger
+WARN_ON() in kvm_read_guest_offset_cached().
+
+Determine the new APF enabled state from the incoming MSR value, do cache
+initialization first on the enable path, and commit msr_en_val only after
+successful initialization. Keep the disable path behavior unchanged.
+
+Reported-by: syzbot+bc0e18379a290e5edfe4@syzkaller.appspotmail.com
+Closes: https://syzkaller.appspot.com/bug?extid=bc0e18379a290e5edfe4
+Link: https://lore.kernel.org/r/aHfD3MczrDpzDX9O@google.com
+Suggested-by: Sean Christopherson <seanjc@google.com>
+Reviewed-by: Xiaoyao Li <xiaoyao.li@intel.com>
+Signed-off-by: Ethan Yang <ethan.yang.kernel@gmail.com>
+---
+v2:
+- Rename helper to __kvm_pv_async_pf_enabled()
+- Rename new_enabled to enable
+- Align wrapped line in kvm_gfn_to_hva_cache_init() call
+---
+ arch/x86/kvm/x86.c | 22 +++++++++++++++-------
+ 1 file changed, 15 insertions(+), 7 deletions(-)
+
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 63afdb6bb07..93b7ad9b52b 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1035,11 +1035,16 @@ bool kvm_require_dr(struct kvm_vcpu *vcpu, int dr)
+ }
+ EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_require_dr);
+ 
+-static bool kvm_pv_async_pf_enabled(struct kvm_vcpu *vcpu)
++static bool __kvm_pv_async_pf_enabled(u64 data)
+ {
+ 	u64 mask = KVM_ASYNC_PF_ENABLED | KVM_ASYNC_PF_DELIVERY_AS_INT;
+ 
+-	return (vcpu->arch.apf.msr_en_val & mask) == mask;
++	return (data & mask) == mask;
++}
++
++static bool kvm_pv_async_pf_enabled(struct kvm_vcpu *vcpu)
++{
++	return __kvm_pv_async_pf_enabled(vcpu->arch.apf.msr_en_val);
+ }
+ 
+ static inline u64 pdptr_rsvd_bits(struct kvm_vcpu *vcpu)
+@@ -3616,6 +3621,7 @@ static int set_msr_mce(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ static int kvm_pv_enable_async_pf(struct kvm_vcpu *vcpu, u64 data)
+ {
+ 	gpa_t gpa = data & ~0x3f;
++	bool enable;
+ 
+ 	/* Bits 4:5 are reserved, Should be zero */
+ 	if (data & 0x30)
+@@ -3632,18 +3638,20 @@ static int kvm_pv_enable_async_pf(struct kvm_vcpu *vcpu, u64 data)
+ 	if (!lapic_in_kernel(vcpu))
+ 		return data ? 1 : 0;
+ 
++	enable = __kvm_pv_async_pf_enabled(data);
++
++	if (enable &&
++	    kvm_gfn_to_hva_cache_init(vcpu->kvm, &vcpu->arch.apf.data, gpa,
++				      sizeof(u64)))
++		return 1;
+ 	vcpu->arch.apf.msr_en_val = data;
+ 
+-	if (!kvm_pv_async_pf_enabled(vcpu)) {
++	if (!enable) {
+ 		kvm_clear_async_pf_completion_queue(vcpu);
+ 		kvm_async_pf_hash_reset(vcpu);
+ 		return 0;
+ 	}
+ 
+-	if (kvm_gfn_to_hva_cache_init(vcpu->kvm, &vcpu->arch.apf.data, gpa,
+-					sizeof(u64)))
+-		return 1;
+-
+ 	vcpu->arch.apf.send_always = (data & KVM_ASYNC_PF_SEND_ALWAYS);
+ 	vcpu->arch.apf.delivery_as_pf_vmexit = data & KVM_ASYNC_PF_DELIVERY_AS_PF_VMEXIT;
+ 
+-- 
+2.47.3
+
