@@ -93,6 +93,7 @@ jobs:
           fi
 
           git send-email \
+            --confirm=never \
             --to "${{ github.event.inputs.to }}" \
             "${CC_ARGS[@]}" \
             "${EXTRA_ARGS[@]}" \
