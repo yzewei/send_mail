@@ -1,0 +1,95 @@
+name: Reply Email
+
+on:
+  workflow_dispatch:
+    inputs:
+      to:
+        description: "Primary recipient"
+        required: true
+        type: string
+      cc:
+        description: "Comma-separated CC list"
+        required: false
+        type: string
+      subject:
+        description: "Mail subject, e.g. Re: [PATCH v3 0/3] ..."
+        required: true
+        type: string
+      in_reply_to:
+        description: "Message-ID to reply to (with or without < >)"
+        required: true
+        type: string
+      body:
+        description: "Mail body, use \\n for new lines"
+        required: true
+        type: string
+      dry_run:
+        description: "Dry run only"
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  send-reply:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install git-send-email
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-email
+
+      - name: Configure git send-email
+        run: |
+          git config sendemail.from "${{ secrets.MAIL_FROM }}"
+          git config sendemail.smtpServer "${{ secrets.SMTP_SERVER }}"
+          git config sendemail.smtpServerPort "${{ secrets.SMTP_PORT }}"
+          git config sendemail.smtpEncryption "${{ secrets.SMTP_ENCRYPTION }}"
+          git config sendemail.smtpUser "${{ secrets.SMTP_USER }}"
+          git config sendemail.smtpPass "${{ secrets.SMTP_PASS }}"
+
+      - name: Build and send reply
+        env:
+          INPUT_TO: ${{ inputs.to }}
+          INPUT_CC: ${{ inputs.cc }}
+          INPUT_SUBJECT: ${{ inputs.subject }}
+          INPUT_IN_REPLY_TO: ${{ inputs.in_reply_to }}
+          INPUT_BODY: ${{ inputs.body }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          in_reply_to="$INPUT_IN_REPLY_TO"
+          if [[ "$in_reply_to" != \<* ]]; then
+            in_reply_to="<$in_reply_to>"
+          fi
+
+          {
+            echo "Subject: $INPUT_SUBJECT"
+            echo
+            printf "%b\n" "$INPUT_BODY"
+          } > /tmp/reply.txt
+
+          cc_args=()
+          if [[ -n "${INPUT_CC// }" ]]; then
+            IFS=',' read -ra cc_list <<< "$INPUT_CC"
+            for c in "${cc_list[@]}"; do
+              c="$(echo "$c" | xargs)"
+              [[ -n "$c" ]] && cc_args+=(--cc "$c")
+            done
+          fi
+
+          cmd=(git send-email --no-git --thread --confirm=never
+               --to "$INPUT_TO"
+               --in-reply-to "$in_reply_to"
+               "${cc_args[@]}"
+               /tmp/reply.txt)
+
+          if [[ "$INPUT_DRY_RUN" == "true" ]]; then
+            "${cmd[@]}" --dry-run
+          else
+            "${cmd[@]}"
+          fi
+
