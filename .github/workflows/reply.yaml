@@ -3,16 +3,28 @@ name: Reply Email
 on:
   workflow_dispatch:
     inputs:
+      mail_profile:
+        description: "SMTP profile"
+        required: true
+        default: "163"
+        type: choice
+        options:
+          - 163
+          - gmail
+      mail_from:
+        description: "Override From address (optional)"
+        required: false
+        type: string
       to:
         description: "Primary recipient"
         required: true
         type: string
       cc:
-        description: "Comma-separated CC list"
+        description: "Comma-separated CC list (optional)"
         required: false
         type: string
       subject:
-        description: "Mail subject, e.g. Re: [PATCH v3 0/3] ..."
+        description: "Subject, e.g. Re: [PATCH v3 0/3] ..."
         required: true
         type: string
       in_reply_to:
@@ -32,25 +44,96 @@ on:
 jobs:
   send-reply:
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install git-send-email
+      - name: Checkout
+        uses: actions/checkout@v4
+  
+      - name: Install git-send-email (standalone)
         run: |
+          set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y git-email
+          sudo apt-get install -y ca-certificates curl perl \
+            libauthen-sasl-perl libio-socket-ssl-perl \
+            libnet-smtp-ssl-perl libmailtools-perl libemail-valid-perl
+
+          GIT_VER="$(git --version | awk '{print $3}')"
+          curl -fsSL "https://raw.githubusercontent.com/git/git/v${GIT_VER}/git-send-email.perl" \
+            | sudo tee /usr/local/bin/git-send-email >/dev/null
+          sudo chmod +x /usr/local/bin/git-send-email
+
+          command -v git-send-email
+          perl -c /usr/local/bin/git-send-email
+
+      - name: Select SMTP profile
+        env:
+          INPUT_MAIL_PROFILE: ${{ inputs.mail_profile }}
+          INPUT_MAIL_FROM: ${{ inputs.mail_from }}
+
+          GMAIL_FROM: ${{ secrets.GMAIL_FROM }}
+          GMAIL_SMTP_SERVER: ${{ secrets.GMAIL_SMTP_SERVER }}
+          GMAIL_SMTP_PORT: ${{ secrets.GMAIL_SMTP_PORT }}
+          GMAIL_SMTP_ENCRYPTION: ${{ secrets.GMAIL_SMTP_ENCRYPTION }}
+          GMAIL_SMTP_USER: ${{ secrets.GMAIL_SMTP_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+
+          M163_FROM: ${{ secrets.M163_FROM }}
+          M163_SMTP_SERVER: ${{ secrets.M163_SMTP_SERVER }}
+          M163_SMTP_PORT: ${{ secrets.M163_SMTP_PORT }}
+          M163_SMTP_ENCRYPTION: ${{ secrets.M163_SMTP_ENCRYPTION }}
+          M163_SMTP_USER: ${{ secrets.M163_SMTP_USER }}
+          M163_SMTP_PASS: ${{ secrets.M163_SMTP_PASS }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$INPUT_MAIL_PROFILE" == "gmail" ]]; then
+            DEF_FROM="$GMAIL_FROM"
+            SMTP_SERVER="$GMAIL_SMTP_SERVER"
+            SMTP_PORT="$GMAIL_SMTP_PORT"
+            SMTP_ENCRYPTION="$GMAIL_SMTP_ENCRYPTION"
+            SMTP_USER="$GMAIL_SMTP_USER"
+            SMTP_PASS="$GMAIL_APP_PASSWORD"
+          else
+            DEF_FROM="$M163_FROM"
+            SMTP_SERVER="$M163_SMTP_SERVER"
+            SMTP_PORT="$M163_SMTP_PORT"
+            SMTP_ENCRYPTION="$M163_SMTP_ENCRYPTION"
+            SMTP_USER="$M163_SMTP_USER"
+            SMTP_PASS="$M163_SMTP_PASS"
+          fi
+
+          FROM_ADDR="${INPUT_MAIL_FROM:-$DEF_FROM}"
+
+          [[ -n "$FROM_ADDR" ]] || { echo "mail_from empty"; exit 1; }
+          [[ -n "$SMTP_SERVER" ]] || { echo "smtp server empty"; exit 1; }
+          [[ -n "$SMTP_PORT" ]] || { echo "smtp port empty"; exit 1; }
+          [[ -n "$SMTP_ENCRYPTION" ]] || { echo "smtp encryption empty"; exit 1; }
+          [[ -n "$SMTP_USER" ]] || { echo "smtp user empty"; exit 1; }
+          [[ -n "$SMTP_PASS" ]] || { echo "smtp pass empty"; exit 1; }
+
+          {
+            echo "MAIL_FROM=$FROM_ADDR"
+            echo "SMTP_SERVER=$SMTP_SERVER"
+            echo "SMTP_PORT=$SMTP_PORT"
+            echo "SMTP_ENCRYPTION=$SMTP_ENCRYPTION"
+            echo "SMTP_USER=$SMTP_USER"
+            echo "SMTP_PASS=$SMTP_PASS"
+          } >> "$GITHUB_ENV"
 
       - name: Configure git send-email
         run: |
-          git config sendemail.from "${{ secrets.MAIL_FROM }}"
-          git config sendemail.smtpServer "${{ secrets.SMTP_SERVER }}"
-          git config sendemail.smtpServerPort "${{ secrets.SMTP_PORT }}"
-          git config sendemail.smtpEncryption "${{ secrets.SMTP_ENCRYPTION }}"
-          git config sendemail.smtpUser "${{ secrets.SMTP_USER }}"
-          git config sendemail.smtpPass "${{ secrets.SMTP_PASS }}"
+          git config sendemail.from "$MAIL_FROM"
+          git config sendemail.smtpServer "$SMTP_SERVER"
+          git config sendemail.smtpServerPort "$SMTP_PORT"
+          git config sendemail.smtpEncryption "$SMTP_ENCRYPTION"
+          git config sendemail.smtpUser "$SMTP_USER"
+          git config sendemail.smtpPass "$SMTP_PASS"
 
-      - name: Build and send reply
+      - name: Configure git identity
+        run: |
+          git config user.name "Ethan Yang"
+          git config user.email "$MAIL_FROM"
+
+      - name: Send reply
         env:
           INPUT_TO: ${{ inputs.to }}
           INPUT_CC: ${{ inputs.cc }}
@@ -72,24 +155,22 @@ jobs:
             printf "%b\n" "$INPUT_BODY"
           } > /tmp/reply.txt
 
-          cc_args=()
+          cmd=(git send-email --thread --confirm=never
+               --to "$INPUT_TO"
+               --in-reply-to "$in_reply_to")
+
           if [[ -n "${INPUT_CC// }" ]]; then
             IFS=',' read -ra cc_list <<< "$INPUT_CC"
             for c in "${cc_list[@]}"; do
               c="$(echo "$c" | xargs)"
-              [[ -n "$c" ]] && cc_args+=(--cc "$c")
+              [[ -n "$c" ]] && cmd+=(--cc "$c")
             done
           fi
 
-          cmd=(git send-email --no-git --thread --confirm=never
-               --to "$INPUT_TO"
-               --in-reply-to "$in_reply_to"
-               "${cc_args[@]}"
-               /tmp/reply.txt)
-
           if [[ "$INPUT_DRY_RUN" == "true" ]]; then
-            "${cmd[@]}" --dry-run
-          else
-            "${cmd[@]}"
+            cmd+=(--dry-run)
           fi
+
+          cmd+=(/tmp/reply.txt)
+          "${cmd[@]}"
 
